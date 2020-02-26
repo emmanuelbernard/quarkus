@@ -35,4 +35,10 @@ public class DataSourceJdbcBuildTimeConfig {
     @ConfigItem
     public Optional<Boolean> enableMetrics = Optional.empty();
 
+    /**
+     * The datasource driver short name
+     */
+    @ConfigItem
+    public Optional<String> shortName;
+
 }

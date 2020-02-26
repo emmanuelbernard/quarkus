@@ -10,8 +10,6 @@ import java.util.ServiceLoader;
 
 import javax.annotation.PreDestroy;
 import javax.inject.Inject;
-import javax.sql.DataSource;
-import javax.sql.XADataSource;
 import javax.transaction.TransactionManager;
 import javax.transaction.TransactionSynchronizationRegistry;
 
@@ -26,10 +24,12 @@ import io.agroal.api.security.NamePrincipal;
 import io.agroal.api.security.SimplePassword;
 import io.agroal.api.transaction.TransactionIntegration;
 import io.agroal.narayana.NarayanaTransactionIntegration;
+import io.quarkus.agroal.JdbcDriver.JdbcDriverLiteral;
 import io.quarkus.agroal.runtime.DataSourcesJdbcBuildTimeConfig.DataSourceJdbcOuterNamedBuildTimeConfig;
 import io.quarkus.agroal.runtime.DataSourcesJdbcRuntimeConfig.DataSourceJdbcOuterNamedRuntimeConfig;
 import io.quarkus.arc.Arc;
 import io.quarkus.arc.ArcContainer;
+import io.quarkus.arc.InstanceHandle;
 import io.quarkus.datasource.common.runtime.DataSourceUtil;
 import io.quarkus.datasource.runtime.DataSourceBuildTimeConfig;
 import io.quarkus.datasource.runtime.DataSourceRuntimeConfig;
@@ -72,6 +72,7 @@ public abstract class AbstractDataSourceProducer {
             DataSourceJdbcBuildTimeConfig dataSourceJdbcBuildTimeConfig,
             DataSourceRuntimeConfig dataSourceRuntimeConfig,
             DataSourceJdbcRuntimeConfig dataSourceJdbcRuntimeConfig,
+            String resolvedDriveClass,
             boolean mpMetricsPresent) {
         checkConfigInjection();
 
@@ -87,28 +88,19 @@ public abstract class AbstractDataSourceProducer {
         // we first make sure that all available JDBC drivers are loaded in the current TCCL
         loadDriversInTCCL();
 
-        String driverName = dataSourceJdbcBuildTimeConfig.driver.get();
         Class<?> driver;
         try {
-            driver = Class.forName(driverName, true, Thread.currentThread().getContextClassLoader());
+            driver = Class.forName(resolvedDriveClass, true, Thread.currentThread().getContextClassLoader());
         } catch (ClassNotFoundException e) {
-            throw new RuntimeException("Unable to load the dataSource driver", e);
+            throw new RuntimeException(
+                    "Unable to load the datasource driver " + resolvedDriveClass + " for datasource " + dataSourceName, e);
         }
+
+        InstanceHandle<AgroalConnectionConfigurer> agroalConnectionConfigurerHandle = Arc.container().instance(
+                AgroalConnectionConfigurer.class,
+                new JdbcDriverLiteral(dataSourceBuildTimeConfig.kind.get()));
 
         String url = dataSourceJdbcRuntimeConfig.url.get();
-
-        //TODO should we do such checks at build time only? All these are currently defined at build - but it could change
-        //depending on if and how we could do Driver auto-detection.
-        final io.quarkus.agroal.runtime.TransactionIntegration transactionIntegration = dataSourceJdbcBuildTimeConfig.transactions;
-        if (transactionIntegration == io.quarkus.agroal.runtime.TransactionIntegration.XA) {
-            if (!XADataSource.class.isAssignableFrom(driver)) {
-                throw new RuntimeException("Driver is not an XA dataSource and XA has been configured");
-            }
-        } else {
-            if (driver != null && !DataSource.class.isAssignableFrom(driver) && !Driver.class.isAssignableFrom(driver)) {
-                throw new RuntimeException("Driver is an XA dataSource and XA has not been configured");
-            }
-        }
 
         AgroalDataSourceConfigurationSupplier dataSourceConfiguration = new AgroalDataSourceConfigurationSupplier();
 
@@ -125,7 +117,7 @@ public abstract class AbstractDataSourceProducer {
                             dataSourceJdbcRuntimeConfig.transactionIsolationLevel.get());
         }
 
-        if (transactionIntegration != io.quarkus.agroal.runtime.TransactionIntegration.DISABLED) {
+        if (dataSourceJdbcBuildTimeConfig.transactions != io.quarkus.agroal.runtime.TransactionIntegration.DISABLED) {
             TransactionIntegration txIntegration = new NarayanaTransactionIntegration(transactionManager,
                     transactionSynchronizationRegistry);
             poolConfiguration.transactionIntegration(txIntegration);
@@ -212,17 +204,12 @@ public abstract class AbstractDataSourceProducer {
             poolConfiguration.maxLifetime(dataSourceJdbcRuntimeConfig.maxLifetime.get());
         }
 
-        // SSL support: we should push the driver specific code to the driver extensions but it will have to do for now
         if (disableSslSupport) {
-            switch (driverName) {
-                case "org.postgresql.Driver":
-                    agroalConnectionFactoryConfigurationSupplier.jdbcProperty("sslmode", "disable");
-                    break;
-                case "org.mariadb.jdbc.Driver":
-                    agroalConnectionFactoryConfigurationSupplier.jdbcProperty("useSSL", "false");
-                    break;
-                default:
-                    log.warn("Agroal does not support disabling SSL for driver " + driverName);
+            if (agroalConnectionConfigurerHandle.isAvailable()) {
+                agroalConnectionConfigurerHandle.get().disableSslSupport(dataSourceBuildTimeConfig.kind.get(),
+                        dataSourceConfiguration);
+            } else {
+                log.warnv("Agroal does not support disabling SSL for database kind {0}", dataSourceBuildTimeConfig.kind.get());
             }
         }
 
